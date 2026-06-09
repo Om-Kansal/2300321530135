@@ -286,3 +286,70 @@ To stop repetitive page loads from crashing the primary database, we use two mai
 <li>State Preservation: The client fetches notifications once when the app boots up and uses real-time streams (SSE) to push updates, rather than re-fetching on every page click.</li>
 
 </ul>
+
+
+<h1>Current Implementation</h1>
+
+<ul>
+
+The current code implements a synchronous loop running on the main request thread, which causes several issues:
+
+<li>
+Blocking Execution & Timeouts :-   Making network requests (send_email, save_db, push_to_app) inside a synchronous loop for 50,000 students will cause the HR’s browser request to time out.
+</li>
+<li>
+Single Point of Failure :- If the third-party email API throws an error midway (as the logs showed for 200 students), the loop terminates abruptly. The remaining students never receive their notifications, and the system has no record of who was missed.
+</li>
+<li>
+Database Connection Pool Exhaustion :- Bombarding the primary database with 50,000 standalone sequential inserts in a tight loop risks freezing the application or choking available connection pools.
+</li>
+</ul>
+
+
+<h3>Design Recommendation Strategy</h3>
+
+<ul>
+    <li>
+    To make this mechanism reliable and fast, we must decouple the core task by moving it to an Asynchronous Message Queue / Worker System.
+    </li>
+    
+    Separation of Concerns: Database vs. Email
+No, saving to the DB and sending the email should absolutely not happen together on the same thread. * Writing to the database is an internal transaction.
+
+
+
+</ul>
+
+
+<h3>New architecture</h3>
+
+<ul>
+
+<li>The Request Trigger: When the HR hits "Notify All", the backend immediately creates a parent transaction record in the database.</li>
+
+<li>Enqueueing: The backend publishes a single lightweight bulk notification event task to a message broker queue and instantly returns a 202 Accepted status to the HR's UI. The frontend is freed instantly.</li>
+
+<li>Worker Processing: Dedicated background worker threads poll the queue, split the massive 50,000 student array into manageable batch chunks (e.g., chunks of 500), and execute operations in parallel.</li>
+
+<li>Resilience: If an email fails for 200 students, only those specific failed individual worker jobs are caught and sent to a Retry Queue with exponential backoff, without crashing the broader system.</li>
+</ul>
+
+
+# Stage 6
+
+## 1. Sorting Strategy
+Priority is managed via a two-tier comparison scheme:
+* **Primary (Weight):** `Placement` (3) > `Result` (2) > `Event` (1).
+* **Secondary (Recency):** Newest `Timestamp` breaks ties when weights match.
+
+## 2. Real-time Optimization at Scale
+Continuously sorting an array every time a live event arrives costs $O(N \log N)$, which stalls the main JavaScript event loop as data sizes expand.
+
+**The Fix:**
+* Maintain a **Min-Heap (Priority Queue)** capped strictly at a fixed size of 10 elements.
+* When a new alert streams in, check if its priority beats the minimum item at the root of the heap. If yes, drop the root and insert the new item ($O(\log 10)$). 
+* This leaves runtime bounded to an ultra-fast **$O(1)$ constant overhead processing window**, preventing incoming memory spikes.
+
+
+<h3>the code in priorityInbox.js file and output screenshot in screenshot.png file</h3>
+
